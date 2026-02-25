@@ -11,14 +11,16 @@
 from __future__ import annotations
 
 import argparse
+import http.cookiejar
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 BASE_URL = "https://new.land.naver.com"
 
@@ -31,12 +33,77 @@ class CrawlOptions:
     max_pages: Optional[int] = None
 
 
-class NaverLandCollector:
-    def __init__(self, timeout: int = 15):
-        self.timeout = timeout
+@dataclass
+class SessionOptions:
+    cookie_string: Optional[str] = None
+    cookie_file: Optional[str] = None
+    bootstrap_browser_cookies: bool = False
 
-    def _build_headers(self, referer: str) -> Dict[str, str]:
-        return {
+
+class NaverLandCollector:
+    def __init__(self, timeout: int = 15, session_options: Optional[SessionOptions] = None):
+        self.timeout = timeout
+        self.session_options = session_options or SessionOptions()
+        self.cookie_jar = http.cookiejar.CookieJar()
+        self.opener = build_opener(HTTPCookieProcessor(self.cookie_jar))
+
+        if self.session_options.cookie_file:
+            self._load_cookie_file(self.session_options.cookie_file)
+
+        if self.session_options.bootstrap_browser_cookies:
+            self._bootstrap_cookies_from_browser()
+
+    def _load_cookie_file(self, path: str) -> None:
+        if not os.path.exists(path):
+            raise RuntimeError(f"쿠키 파일을 찾을 수 없습니다: {path}")
+        jar = http.cookiejar.MozillaCookieJar(path)
+        try:
+            jar.load(ignore_discard=True, ignore_expires=True)
+        except Exception as exc:
+            raise RuntimeError(f"쿠키 파일 로딩 실패: {path} ({exc})") from exc
+        for cookie in jar:
+            self.cookie_jar.set_cookie(cookie)
+
+    def _bootstrap_cookies_from_browser(self) -> None:
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:
+            raise RuntimeError(
+                "Playwright가 설치되어 있지 않아 브라우저 쿠키 부트스트랩을 수행할 수 없습니다. "
+                "`pip install playwright` 및 `playwright install chromium` 후 재시도하세요."
+            ) from exc
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(locale="ko-KR")
+            page = context.new_page()
+            page.goto(f"{BASE_URL}/complexes", wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(1200)
+            for c in context.cookies():
+                ck = http.cookiejar.Cookie(
+                    version=0,
+                    name=c["name"],
+                    value=c["value"],
+                    port=None,
+                    port_specified=False,
+                    domain=c.get("domain", "new.land.naver.com"),
+                    domain_specified=True,
+                    domain_initial_dot=c.get("domain", "").startswith("."),
+                    path=c.get("path", "/"),
+                    path_specified=True,
+                    secure=c.get("secure", False),
+                    expires=c.get("expires"),
+                    discard=False,
+                    comment=None,
+                    comment_url=None,
+                    rest={},
+                    rfc2109=False,
+                )
+                self.cookie_jar.set_cookie(ck)
+            browser.close()
+
+    def _build_headers(self, referer: str, cookie_header: Optional[str] = None) -> Dict[str, str]:
+        headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -46,13 +113,19 @@ class NaverLandCollector:
             "Referer": referer,
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
         }
+        if cookie_header:
+            headers["Cookie"] = cookie_header
+        return headers
 
     def _request_json(self, path: str, params: Dict[str, Any], referer: str) -> Dict[str, Any]:
         query = urlencode(params, doseq=True)
         url = f"{BASE_URL}{path}?{query}"
-        req = Request(url=url, headers=self._build_headers(referer))
+        req = Request(
+            url=url,
+            headers=self._build_headers(referer, cookie_header=self.session_options.cookie_string),
+        )
         try:
-            with urlopen(req, timeout=self.timeout) as res:
+            with self.opener.open(req, timeout=self.timeout) as res:
                 return json.loads(res.read().decode("utf-8"))
         except HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")
@@ -60,6 +133,7 @@ class NaverLandCollector:
                 f"HTTP {exc.code} 오류 ({url})\n"
                 "네이버 봇 차단/접근 제한일 수 있습니다. "
                 "브라우저에서 먼저 접속 후 동일 네트워크에서 재시도하거나 요청 간격을 늘려보세요.\n"
+                "필요 시 --cookie-file / --cookie 또는 --bootstrap-browser-cookies 옵션을 사용하세요.\n"
                 f"응답: {body[:250]}"
             ) from exc
         except URLError as exc:
@@ -191,6 +265,9 @@ def build_parser() -> argparse.ArgumentParser:
     search = sub.add_parser("search", help="키워드로 단지 검색")
     search.add_argument("--keyword", required=True, help="검색 키워드 (예: 판교푸르지오)")
     search.add_argument("--output", default="complex_search.json", help="검색 결과 저장 파일")
+    search.add_argument("--cookie", default=None, help="Cookie 헤더 문자열")
+    search.add_argument("--cookie-file", default=None, help="Netscape 포맷 쿠키 파일 경로")
+    search.add_argument("--bootstrap-browser-cookies", action="store_true", help="Playwright로 브라우저 쿠키 자동 획득")
 
     crawl = sub.add_parser("crawl", help="단지 번호로 매물 전체페이지 수집")
     crawl.add_argument("--complex-no", required=True, help="단지 번호")
@@ -199,6 +276,9 @@ def build_parser() -> argparse.ArgumentParser:
     crawl.add_argument("--page-delay", type=float, default=0.15, help="페이지 요청 간격(초)")
     crawl.add_argument("--real-estate-types", default="APT:ABYG:JGC:PRE")
     crawl.add_argument("--trade-types", default="A1:B1:B2:B3")
+    crawl.add_argument("--cookie", default=None, help="Cookie 헤더 문자열")
+    crawl.add_argument("--cookie-file", default=None, help="Netscape 포맷 쿠키 파일 경로")
+    crawl.add_argument("--bootstrap-browser-cookies", action="store_true", help="Playwright로 브라우저 쿠키 자동 획득")
 
     crawl_from_search = sub.add_parser(
         "crawl-from-search",
@@ -211,15 +291,24 @@ def build_parser() -> argparse.ArgumentParser:
     crawl_from_search.add_argument("--page-delay", type=float, default=0.15)
     crawl_from_search.add_argument("--real-estate-types", default="APT:ABYG:JGC:PRE")
     crawl_from_search.add_argument("--trade-types", default="A1:B1:B2:B3")
+    crawl_from_search.add_argument("--cookie", default=None, help="Cookie 헤더 문자열")
+    crawl_from_search.add_argument("--cookie-file", default=None, help="Netscape 포맷 쿠키 파일 경로")
+    crawl_from_search.add_argument("--bootstrap-browser-cookies", action="store_true", help="Playwright로 브라우저 쿠키 자동 획득")
 
     return parser
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    collector = NaverLandCollector()
 
     try:
+        collector = NaverLandCollector(
+            session_options=SessionOptions(
+                cookie_string=getattr(args, "cookie", None),
+                cookie_file=getattr(args, "cookie_file", None),
+                bootstrap_browser_cookies=getattr(args, "bootstrap_browser_cookies", False),
+            )
+        )
         if args.command == "search":
             complexes = collector.search_complexes(args.keyword)
             result = {
